@@ -804,6 +804,67 @@ describe('Java anonymous-class override synthesis — end-to-end', () => {
 
     cg.close();
   });
+
+  it('persists direct calls from an interface-typed receiver to implementation methods', async () => {
+    tmpDir = fs.mkdtempSync(path.join(os.tmpdir(), 'cg-java-interface-dispatch-'));
+    fs.writeFileSync(
+      path.join(tmpDir, 'ProductService.java'),
+      'package com.example;\n' +
+        'public interface ProductService {\n' +
+        '  String findAll();\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ProductServiceImpl.java'),
+      'package com.example;\n' +
+        'public class ProductServiceImpl implements ProductService {\n' +
+        '  public String findAll() { return "ok"; }\n' +
+        '}\n'
+    );
+    fs.writeFileSync(
+      path.join(tmpDir, 'ProductController.java'),
+      'package com.example;\n' +
+        'public class ProductController {\n' +
+        '  private final ProductService productService;\n' +
+        '  public ProductController(ProductService productService) { this.productService = productService; }\n' +
+        '  public String findAll() { return productService.findAll(); }\n' +
+        '}\n'
+    );
+
+    const cg = CodeGraph.initSync(tmpDir);
+    await cg.indexAll();
+
+    const controllerFindAll = cg
+      .getNodesByKind('method')
+      .find((n) => n.qualifiedName === 'com.example::ProductController::findAll');
+    const interfaceFindAll = cg
+      .getNodesByKind('method')
+      .find((n) => n.qualifiedName === 'com.example::ProductService::findAll');
+    const implFindAll = cg
+      .getNodesByKind('method')
+      .find((n) => n.qualifiedName === 'com.example::ProductServiceImpl::findAll');
+
+    expect(controllerFindAll).toBeDefined();
+    expect(interfaceFindAll).toBeDefined();
+    expect(implFindAll).toBeDefined();
+
+    const interfaceCall = cg
+      .getOutgoingEdges(controllerFindAll!.id)
+      .find((e) => e.kind === 'calls' && e.target === interfaceFindAll!.id);
+    expect(interfaceCall, 'declared interface call should remain persisted').toBeDefined();
+
+    const dispatchCall = cg
+      .getOutgoingEdges(controllerFindAll!.id)
+      .find((e) => e.kind === 'calls' && e.target === implFindAll!.id);
+    expect(dispatchCall, 'interface receiver should dispatch to implementation method').toBeDefined();
+    expect(dispatchCall!.provenance).toBe('heuristic');
+    expect((dispatchCall!.metadata as { synthesizedBy?: string } | undefined)?.synthesizedBy).toBe(
+      'interface-dispatch'
+    );
+    expect((dispatchCall!.metadata as { via?: string } | undefined)?.via).toBe('ProductService');
+
+    cg.close();
+  });
 });
 
 describe('Go gRPC stub→impl synthesis', () => {

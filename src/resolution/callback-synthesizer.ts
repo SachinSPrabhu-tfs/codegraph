@@ -723,6 +723,94 @@ function interfaceOverrideEdges(queries: QueryBuilder): Edge[] {
 }
 
 /**
+ * Direct interface-dispatch fan-out. `interfaceOverrideEdges` links the abstract
+ * contract method to each concrete override (`Iface.method -> Impl.method`).
+ * This pass also links every caller that resolved to the interface method
+ * directly to the concrete override (`caller -> Impl.method`), so persisted
+ * callers/callees, route traces, and impact queries can follow runtime dispatch
+ * without doing a second traversal through the interface node.
+ */
+function directInterfaceDispatchEdges(queries: QueryBuilder): Edge[] {
+  const edges: Edge[] = [];
+  const seen = new Set<string>();
+  const methodsOf = (classId: string): Node[] =>
+    queries
+      .getOutgoingEdges(classId, ['contains'])
+      .map((e) => queries.getNodeById(e.target))
+      .filter((n): n is Node => !!n && n.kind === 'method');
+
+  const interfaceKinds = new Set<NodeKind>(['interface', 'trait', 'protocol']);
+  const concreteKinds = new Set<NodeKind>(['class', 'struct']);
+  const interfaceMethods = queries
+    .getNodesByKind('method')
+    .filter((method) => {
+      if (!IFACE_OVERRIDE_LANGS.has(method.language)) return false;
+      return queries
+        .getIncomingEdges(method.id, ['contains'])
+        .some((edge) => {
+          const owner = queries.getNodeById(edge.source);
+          return !!owner && owner.language === method.language && interfaceKinds.has(owner.kind);
+        });
+    });
+
+  for (const ifaceMethod of interfaceMethods) {
+    const ifaceOwners = queries
+      .getIncomingEdges(ifaceMethod.id, ['contains'])
+      .map((edge) => queries.getNodeById(edge.source))
+      .filter((n): n is Node => !!n && n.language === ifaceMethod.language && interfaceKinds.has(n.kind));
+    if (ifaceOwners.length === 0) continue;
+
+    const callers = queries.getIncomingEdges(ifaceMethod.id, ['calls']);
+    if (callers.length === 0) continue;
+
+    for (const iface of ifaceOwners) {
+      const implClasses = queries
+        .getIncomingEdges(iface.id, ['implements', 'extends'])
+        .map((edge) => queries.getNodeById(edge.source))
+        .filter((n): n is Node => !!n && n.language === iface.language && concreteKinds.has(n.kind));
+      if (implClasses.length === 0) continue;
+
+      for (const implClass of implClasses) {
+        const implMethods = methodsOf(implClass.id).filter(
+          (method) => method.language === ifaceMethod.language && method.name === ifaceMethod.name,
+        );
+        if (implMethods.length === 0) continue;
+
+        for (const callerEdge of callers) {
+          for (const implMethod of implMethods) {
+            if (callerEdge.source === implMethod.id) continue;
+            const key = `${callerEdge.source}>${implMethod.id}:interface-dispatch`;
+            if (seen.has(key)) continue;
+            const alreadyExists = queries
+              .getOutgoingEdges(callerEdge.source, ['calls'])
+              .some((edge) => edge.target === implMethod.id);
+            if (alreadyExists) continue;
+
+            seen.add(key);
+            edges.push({
+              source: callerEdge.source,
+              target: implMethod.id,
+              kind: 'calls',
+              line: callerEdge.line ?? ifaceMethod.startLine,
+              column: callerEdge.column,
+              provenance: 'heuristic',
+              metadata: {
+                synthesizedBy: 'interface-dispatch',
+                via: iface.name,
+                viaMethod: ifaceMethod.name,
+                registeredAt: `${implMethod.filePath}:${implMethod.startLine}`,
+              },
+            });
+          }
+        }
+      }
+    }
+  }
+
+  return edges;
+}
+
+/**
  * Go gRPC stub → impl bridge. The protoc-gen-go-grpc codegen emits an
  * `UnimplementedXxxServer` struct in `*_grpc.pb.go` carrying one method
  * per service RPC; the real handler is a hand-written struct in another
@@ -1679,6 +1767,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
   const flutterEdges = flutterBuildEdges(queries, ctx);
   const cppEdges = cppOverrideEdges(queries);
   const ifaceEdges = interfaceOverrideEdges(queries);
+  const directIfaceEdges = directInterfaceDispatchEdges(queries);
   const kotlinExpectActual = kotlinExpectActualEdges(queries);
   const goGrpcEdges = goGrpcStubImplEdges(queries);
   const rnEventEdgesList = rnEventEdges(ctx);
@@ -1702,6 +1791,7 @@ export function synthesizeCallbackEdges(queries: QueryBuilder, ctx: ResolutionCo
     ...flutterEdges,
     ...cppEdges,
     ...ifaceEdges,
+    ...directIfaceEdges,
     ...kotlinExpectActual,
     ...goGrpcEdges,
     ...rnEventEdgesList,
